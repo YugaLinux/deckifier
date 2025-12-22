@@ -1,5 +1,10 @@
 #!/bin/bash
 
+if [ -e "/home/tik/.config/autostart/org.opensuse.tik.desktop" ]; then
+  # We are in the installer
+  exit 0
+fi
+
 # GNOME/GDM (Wayland-only)
 if [[ -n $(systemctl status gdm) ]]; then
   # set new default session (Wayland Session=)
