@@ -1,111 +1,142 @@
 #!/usr/bin/bash
-set -e
+set -euo pipefail
 
-die() { echo >&2 "!! $*"; exit 1; }
+die() { echo "!! $*" >&2; exit 1; }
 
-# Wayland-only
-export DESKTOP_WAYLAND=true
+is_kwin_running()   { pgrep -f kwin   >/dev/null 2>&1 || return 1; }
+is_mutter_running() { pgrep -f mutter >/dev/null 2>&1 || return 1; }
+is_gamescope_steam_running() { systemctl --user is-active --quiet gamescope-session-plus@steam.service; }
 
+dm_is_active() { systemctl is-active --quiet "$1"; }
+dm_is_gdm()    { dm_is_active gdm; }
+dm_is_sddm()   { dm_is_active sddm; }
+dm_is_lightdm(){ dm_is_active lightdm; }
+
+ensure_dir() { mkdir -p "$1"; }
+
+LOCKFILE="/tmp/$(basename "$0").$UID.lock"
+
+# LightDM files
+LIGHTDM_SESSION_FILE="/etc/lightdm/lightdm.conf.d/10-autologin-session.conf"
+LIGHTDM_USER_FILE="/etc/lightdm/lightdm.conf.d/00-autologin-user.conf"
+
+# sentinel
 SENTINEL_FILE="steamos-session-select"
 
 session="${1:-gamescope}"
-session_type="wayland"
 
-session_launcher=""
-create_sentinel=""
+# user used for autologin
+TARGET_USER="${3:-${USER:-}}"
 
-if [[ "$2" == "--sentinel-created" ]]; then
-  SENTINEL_CREATED=1
-  session_type="wayland"
-fi
+if [[ "${2:-}" != "--root" ]]; then
+  [[ $EUID -eq 0 ]] && die "Run this script as your user, not root."
+  [[ -n ${HOME:-} ]] || die "\$HOME not set"
 
-# Update config sentinel
-if [[ -z ${SENTINEL_CREATED:-} ]]; then
-  [[ $EUID == 0 ]] && die "Running $0 as root is not allowed"
-
-  [[ -n ${HOME+x} ]] || die "No \$HOME variable"
+  # Update config sentinel like the newer script
   config_dir="${XDG_CONF_DIR:-"$HOME/.config"}"
-  session_type=$(
-    cd "$HOME"
-    mkdir -p "$config_dir"
+  ensure_dir "$config_dir"
+  (
     cd "$config_dir"
     if [[ -f "steamos-session-type" ]]; then
-      cp steamos-session-type "$SENTINEL_FILE"
+      cp "steamos-session-type" "$SENTINEL_FILE"
     else
       echo "wayland" > "$SENTINEL_FILE"
     fi
-    cat "$SENTINEL_FILE"
-  )
+  ) >/dev/null 2>&1 || true
 
   # clear steam game desktop shortcut clutter
-  DATA_HOME=${XDG_DATA_HOME:-$HOME/.local/share}
-  grep -r --files-with-matches "Exec=steam steam://rungameid/" "${DATA_HOME}"/applications/ | tr '\n' '\0' | xargs -0 -I {} rm {} || true
+  DATA_HOME=${XDG_DATA_HOME:-"$HOME/.local/share"}
+  if [[ -d "$DATA_HOME/applications" ]]; then
+    grep -r --files-with-matches "Exec=steam steam://rungameid/" "$DATA_HOME/applications/" \
+      | tr '\n' '\0' | xargs -0 -r rm -- || true
+  fi
 
-  # If we were executed as a session user and then re-execute as root below, we don't want to set root's sentinel too
-  export SENTINEL_CREATED=1
+  # Ask the current compositor/session to log out
+  is_kwin_running   && qdbus6 org.kde.Shutdown /Shutdown org.kde.Shutdown.logout || true
+  is_mutter_running && gnome-session-quit --no-prompt || true
+  is_gamescope_steam_running && steam -shutdown || true
+
+  # Re-run as root to update DM config
+  exec pkexec "$(realpath "$0")" "$session" --root "$USER"
+  exit 0
 fi
 
-# We use "plasma" as "desktop" to hook up to SteamOS's scripts
+[[ $EUID -eq 0 ]] || die "Internal error: root phase not running as root."
+[[ -n ${TARGET_USER:-} ]] || die "No target user provided."
+
+# locking
+cleanup() { rm -f "$LOCKFILE"; }
+exec 200>"$LOCKFILE"
+flock -n 200 || die "Another instance is already running."
+trap cleanup EXIT INT TERM HUP
+
+# Detect DM
+dm="unknown"
+if dm_is_gdm; then
+  dm="gdm"
+elif dm_is_sddm; then
+  dm="sddm"
+elif dm_is_lightdm; then
+  dm="lightdm"
+else
+  dm="unknown"
+fi
+
+session_launcher=""
 case "$session" in
-  plasma-wayland-persistent)
-    if [[ -n $(systemctl status gdm | grep running) ]]; then
-      session_launcher="gnome-wayland"
-    elif [[ -n $(systemctl status sddm | grep running) ]]; then
-      session_launcher="plasmawayland"
-    fi
-  ;;
-  desktop|plasma)
-    if [[ -n $(systemctl status gdm | grep running) ]]; then
-      session_launcher="gnome-wayland"
-    elif [[ -n $(systemctl status sddm | grep running) ]]; then
-      session_launcher="plasmawayland"
-    fi
-    create_sentinel=1
-  ;;
   gamescope)
     session_launcher="gamescope-session-steam"
-    create_sentinel=1
-  ;;
+    ;;
+  desktop|plasma)
+    if [[ "$dm" == "gdm" ]]; then
+      session_launcher="gnome-wayland"
+    elif [[ "$dm" == "sddm" ]]; then
+      session_launcher="plasmawayland"
+    else
+      session_launcher=""
+    fi
+    ;;
+  plasma-wayland-persistent|plasma-x11-persistent)
+    if [[ "$dm" == "gdm" ]]; then
+      session_launcher="gnome-wayland"
+    elif [[ "$dm" == "sddm" ]]; then
+      session_launcher="plasmawayland"
+    else
+      session_launcher=""
+    fi
+    ;;
   *)
-    echo >&2 "!! Unrecognized session '$session'"
-    exit 1
-  ;;
+    die "Unrecognised session '$session'"
+    ;;
 esac
 
-echo "Updated user selected session to $session_launcher"
+echo "Detected DM: $dm"
+echo "Selected session launcher: $session_launcher"
+echo "Autologin user: $TARGET_USER"
 
-if [[ -n ${4:-} ]]; then
-  GDMUSER="$4"
+if [[ -f /etc/sysconfig/displaymanager ]]; then
+    sed -i "s|DISPLAYMANAGER_AUTOLOGIN=.*|DISPLAYMANAGER_AUTOLOGIN=\"$TARGET_USER\"|g" /etc/sysconfig/displaymanager
 fi
 
-# Become root
-if [[ $EUID != 0 ]]; then
-  exec pkexec "$(realpath "$0")" "$session" --sentinel-created "$session_type" "$USER"
-  exit 1
-fi
-
-# Find the home directory of the specified user
-USER_HOME=$(getent passwd "$GDMUSER" | cut -d: -f6)
-
-# GNOME/GDM (Wayland-only)
+# GNOME/GDM
 if [[ -n $(systemctl status gdm | grep running) ]]; then
   # set new default session (Wayland Session=)
-  if [[ -f /var/lib/AccountsService/users/"$GDMUSER" ]]; then
-    sed -i "s|Session=.*|Session=$session_launcher|g" /var/lib/AccountsService/users/"$GDMUSER"
+  if [[ -f /var/lib/AccountsService/users/"$TARGET_USER" ]]; then
+    sed -i "s|Session=.*|Session=$session_launcher|g" /var/lib/AccountsService/users/"$TARGET_USER"
   else
-    echo "[User]" > /var/lib/AccountsService/users/"$GDMUSER"
-    echo "Session=$session_launcher" >> /var/lib/AccountsService/users/"$GDMUSER"
+    echo "[User]" > /var/lib/AccountsService/users/"$TARGET_USER"
+    echo "Session=$session_launcher" >> /var/lib/AccountsService/users/"$TARGET_USER"
   fi
 
   # enable auto-login (timedlogin)
   if [[ -f /etc/gdm/custom.conf ]]; then
     sed -i "s|TimedLoginEnable=.*|TimedLoginEnable=true|g" /etc/gdm/custom.conf
     sed -i "s|TimedLoginDelay=.*|TimedLoginDelay=1|g" /etc/gdm/custom.conf
-    sed -i "s|TimedLogin=.*|TimedLogin=$GDMUSER|g" /etc/gdm/custom.conf
+    sed -i "s|TimedLogin=.*|TimedLogin=$TARGET_USER|g" /etc/gdm/custom.conf
     if [[ -z $(grep -F "TimedLogin" /etc/gdm/custom.conf) ]]; then
       sed -i "/\[daemon\]/a\TimedLoginEnable=true" /etc/gdm/custom.conf
       sed -i "/TimedLoginEnable=true/a\TimedLoginDelay=1" /etc/gdm/custom.conf
-      sed -i "/TimedLoginDelay=1/a\TimedLogin=$GDMUSER" /etc/gdm/custom.conf
+      sed -i "/TimedLoginDelay=1/a\TimedLogin=$TARGET_USER" /etc/gdm/custom.conf
     fi
   fi
 fi
@@ -125,3 +156,9 @@ fi
 if [[ -n $(systemctl status lightdm | grep running) ]]; then
   sed -i "s|autologin-session=.*|autologin-session=$session_launcher|g" /etc/lightdm/lightdm.conf.d/10-autologin-session.conf
 fi
+
+if [[ "$dm" == "unknown" ]]; then
+  die "No supported display manager detected (gdm/sddm/lightdm)."
+fi
+
+echo "Done. Session set to '$session_launcher' for '$TARGET_USER'."
