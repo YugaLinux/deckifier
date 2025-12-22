@@ -1,11 +1,11 @@
 [Unit]
-Description=Set autologin-session to gamescope-session
+Description=Set autologin-session to gamescope-session-steam
 After=local-fs.target
-Before=display-manager.service
+Before=sddm.service gdm.service lightdm.service
 
 [Service]
 Type=oneshot
 ExecStart=/usr/bin/steamos-startup-gamescope
 
 [Install]
-WantedBy=multi-user.target
+RequiredBy=sddm.service gdm.service lightdm.service

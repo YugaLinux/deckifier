@@ -1,110 +1,127 @@
 #!/usr/bin/bash
-set -euo pipefail
+set -e
 
-session_conf="/etc/trup/session.conf";  . "$session_conf"
+die() { echo >&2 "!! $*"; exit 1; }
 
-###############################################################################
-# helpers
-###############################################################################
-is_kwin_running()   { pgrep -f kwin   >/dev/null 2>&1 || return 1; }
-is_mutter_running() { pgrep -f mutter >/dev/null 2>&1 || return 1; }
+# Wayland-only
+export DESKTOP_WAYLAND=true
 
-die() { echo "!! $*" >&2; exit 1; }
-
-###############################################################################
-# constants / globals
-###############################################################################
-SESSION_CONF_FILE="/etc/lightdm/lightdm.conf.d/10-gamescope-session.conf"
-USER_CONF_FILE="/etc/lightdm/lightdm.conf.d/00-autologin-user.conf"
-LOCKFILE="/tmp/$(basename "$0").$UID.lock"
+SENTINEL_FILE="steamos-session-select"
 
 session="${1:-gamescope}"
+session_type="wayland"
 
-###############################################################################
-# phase 1 – run as *user* (do NOT allow sudo)
-###############################################################################
-if [[ "${2:-}" != "--root" ]]; then
-    [[ $EUID -eq 0 ]] && die "Run this script as your user, not root."
-    [[ -n ${HOME:-}    ]] || die "\$HOME not set"
+session_launcher=""
+create_sentinel=""
 
-    # remove Steam desktop shortcuts
-    DATA_HOME=${XDG_DATA_HOME:-"$HOME/.local/share"}
-    grep -l "Exec=steam steam://rungameid/" "$DATA_HOME"/applications/* 2>/dev/null \
-        | xargs -r rm -- || true
-
-    # politely ask the current compositor to log out
-    is_kwin_running   && qdbus6 org.kde.Shutdown /Shutdown org.kde.Shutdown.logout
-    is_mutter_running && gnome-session-quit --no-prompt
-
-    exec pkexec "$0" "$session" --root   # re‑run as root
+if [[ "$2" == "--sentinel-created" ]]; then
+  SENTINEL_CREATED=1
+  session_type="wayland"
 fi
 
-###############################################################################
-# phase 2 – run as *root*
-###############################################################################
-# locking
-cleanup() { rm -f "$LOCKFILE"; }
-exec 200>"$LOCKFILE"
-flock -n 200 || die "Another instance is already running."
-trap cleanup EXIT INT TERM HUP
+# Update config sentinel
+if [[ -z ${SENTINEL_CREATED:-} ]]; then
+  [[ $EUID == 0 ]] && die "Running $0 as root is not allowed"
 
-# map session → launcher
+  [[ -n ${HOME+x} ]] || die "No \$HOME variable"
+  config_dir="${XDG_CONF_DIR:-"$HOME/.config"}"
+  session_type=$(
+    cd "$HOME"
+    mkdir -p "$config_dir"
+    cd "$config_dir"
+    if [[ -f "steamos-session-type" ]]; then
+      cp steamos-session-type "$SENTINEL_FILE"
+    else
+      echo "wayland" > "$SENTINEL_FILE"
+    fi
+    cat "$SENTINEL_FILE"
+  )
+
+  # clear steam game desktop shortcut clutter
+  DATA_HOME=${XDG_DATA_HOME:-$HOME/.local/share}
+  grep -r --files-with-matches "Exec=steam steam://rungameid/" "${DATA_HOME}"/applications/ | tr '\n' '\0' | xargs -0 -I {} rm {} || true
+
+  # If we were executed as a session user and then re-execute as root below, we don't want to set root's sentinel too
+  export SENTINEL_CREATED=1
+fi
+
+# We use "plasma" as "desktop" to hook up to SteamOS's scripts
 case "$session" in
-  plasma-wayland-persistent|plasma-x11-persistent) session_launcher="$desktop_session" ;;
-  desktop|plasma)                                 session_launcher="${desktop_session}-session-oneshot" ;;
-  gamescope)                                      session_launcher="gamescope-session-steam" ;;
-  *) die "Unrecognised session '$session'" ;;
+  plasma-wayland-persistent)
+    if [[ -n $(systemctl status gdm | grep running) ]]; then
+      session_launcher="gnome-wayland"
+    elif [[ -n $(systemctl status sddm | grep running) ]]; then
+      session_launcher="plasmawayland"
+    fi
+  ;;
+  desktop|plasma)
+    if [[ -n $(systemctl status gdm | grep running) ]]; then
+      session_launcher="gnome-wayland"
+    elif [[ -n $(systemctl status sddm | grep running) ]]; then
+      session_launcher="plasmawayland"
+    fi
+    create_sentinel=1
+  ;;
+  gamescope)
+    session_launcher="gamescope-session-steam"
+    create_sentinel=1
+  ;;
+  *)
+    echo >&2 "!! Unrecognized session '$session'"
+    exit 1
+  ;;
 esac
-echo "Selected session launcher: $session_launcher"
 
-# wait until the old compositor is really gone
-while is_kwin_running   ; do sleep 0.5; done
-while is_mutter_running ; do sleep 0.5; done
+echo "Updated user selected session to $session_launcher"
 
-###############################################################################
-# restart Display Manager – loop until it comes up, toggling the session each
-# time it fails (gamescope <-> desktop)
-###############################################################################
-restart_dm() {
-    systemctl reset-failed display-manager.service || true
-    systemctl restart display-manager.service || true
-}
+if [[ -n ${4:-} ]]; then
+  GDMUSER="$4"
+fi
 
-start_and_wait() {
-    restart_dm                     # stop → start DM
-    sleep 3                        # give it 3 s to come up
+# Become root
+if [[ $EUID != 0 ]]; then
+  exec pkexec "$(realpath "$0")" "$session" --sentinel-created "$session_type" "$USER"
+  exit 1
+fi
 
-    if systemctl is-active --quiet display-manager.service; then
-        return 0                  # DM is active → success
-    else
-        return 1                  # DM not active → failure
+# Find the home directory of the specified user
+USER_HOME=$(getent passwd "$GDMUSER" | cut -d: -f6)
+
+# GNOME/GDM (Wayland-only)
+if [[ -n $(systemctl status gdm | grep running) ]]; then
+  # set new default session (Wayland Session=)
+  if [[ -f /var/lib/AccountsService/users/"$GDMUSER" ]]; then
+    sed -i "s|Session=.*|Session=$session_launcher|g" /var/lib/AccountsService/users/"$GDMUSER"
+  else
+    echo "[User]" > /var/lib/AccountsService/users/"$GDMUSER"
+    echo "Session=$session_launcher" >> /var/lib/AccountsService/users/"$GDMUSER"
+  fi
+
+  # enable auto-login (timedlogin)
+  if [[ -f /etc/gdm/custom.conf ]]; then
+    sed -i "s|TimedLoginEnable=.*|TimedLoginEnable=true|g" /etc/gdm/custom.conf
+    sed -i "s|TimedLoginDelay=.*|TimedLoginDelay=1|g" /etc/gdm/custom.conf
+    sed -i "s|TimedLogin=.*|TimedLogin=$GDMUSER|g" /etc/gdm/custom.conf
+    if [[ -z $(grep -F "TimedLogin" /etc/gdm/custom.conf) ]]; then
+      sed -i "/\[daemon\]/a\TimedLoginEnable=true" /etc/gdm/custom.conf
+      sed -i "/TimedLoginEnable=true/a\TimedLoginDelay=1" /etc/gdm/custom.conf
+      sed -i "/TimedLoginDelay=1/a\TimedLogin=$GDMUSER" /etc/gdm/custom.conf
     fi
-}
+  fi
+fi
 
-# build the two launcher names (gamescope  <->  desktop)
-gamescope_launcher="gamescope-session-steam"
-desktop_launcher="${desktop_session}-session-oneshot"
-
-# decide which one we start with
-current_launcher="$session_launcher"         # set earlier in the script
-
-for ((attempt=1; ; attempt++)); do
-    printf '[Seat:*]\nautologin-session=%s\n' "$current_launcher" > "$SESSION_CONF_FILE"
-    printf '[Seat:*]\nautologin-user=deck\n' > "$USER_CONF_FILE"
-    echo "Attempt $attempt: starting Display Manager with $current_launcher"
-
-    if start_and_wait; then
-        echo "Display Manager is active with $current_launcher (after $attempt attempt(s))"
-        session_launcher="$current_launcher"   # final session that succeeded
-        break
+# KDE/SDDM
+if [[ -n $(systemctl status sddm | grep running) ]]; then
+  if [[ -f /etc/sddm.conf.d/kde_settings.conf ]]; then
+    sed -i "s|Session=.*|Session=$session_launcher|g" /etc/sddm.conf.d/kde_settings.conf
+    sed -i "s|Relogin=.*|Relogin=true|g" /etc/sddm.conf.d/kde_settings.conf
+    if [[ -z $(grep -F "Relogin" /etc/sddm.conf.d/kde_settings.conf) ]]; then
+      sed -i '/\[Autologin\]/a\Relogin=true' /etc/sddm.conf.d/kde_settings.conf
     fi
+  fi
+fi
 
-    echo "Display Manager failed with $current_launcher"
-
-    # toggle launcher for next iteration
-    if [[ "$current_launcher" == "$gamescope_launcher" ]]; then
-        current_launcher="$desktop_launcher"
-    else
-        current_launcher="$gamescope_launcher"
-    fi
-done
+# LightDM
+if [[ -n $(systemctl status lightdm | grep running) ]]; then
+  sed -i "s|autologin-session=.*|autologin-session=$session_launcher|g" /etc/lightdm/lightdm.conf.d/10-autologin-session.conf
+fi

@@ -1,8 +1,0 @@
-[Desktop Entry]
-Name=KDE Plasma (single time session)
-Comment=This session logs you into Plasma one time
-Exec=/usr/bin/plasma-session-oneshot
-TryExec=/usr/bin/plasma-session-oneshot
-Type=Application
-DesktopNames=KDE
-X-KDE-PluginInfo-Version=5.91.90

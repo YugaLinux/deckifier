@@ -1,3 +1,0 @@
-[org/gnome/shell]
-# List all extensions that you want to have enabled for all users
-enabled-extensions=['ding@rastersoft.com', 'dash-to-dock@micxgx.gmail.com', 'appindicatorsupport@rgcjonas.gmail.com']

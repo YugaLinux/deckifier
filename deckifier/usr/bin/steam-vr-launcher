@@ -1,7 +1,0 @@
-#!/bin/bash
-
-# Get the home directory of the user running the script
-USER_HOME=$(eval echo ~$SUDO_USER)
-
-# Run the original command with the appropriate user-specific path
-/usr/bin/setcap CAP_SYS_NICE=eip $USER_HOME/.local/share/Steam/steamapps/common/SteamVR/bin/linux64/vrcompositor-launcher
