@@ -10,15 +10,15 @@ if [[ $# -eq 1 ]]; then
   case "$1" in
     "-c")
       case "$BRANCH" in
-        "stable")
+        "rel")
           echo "rel"
           exit 0
           ;;
-        "testing")
+        "beta")
           echo "beta"
           exit 0
           ;;
-        "unstable")
+        "rc")
           echo "rc"
           exit 0
           ;;
@@ -38,15 +38,15 @@ if [[ $# -eq 1 ]]; then
       exit 0
       ;;
     "rel")
-      sed -i "s/^BRANCH=.*/BRANCH=stable/" "$BRANCH_PATH"
+      sed -i "s/^BRANCH=.*/BRANCH=rel/" "$BRANCH_PATH"
       exit 0
       ;;
     "beta")
-      sed -i "s/^BRANCH=.*/BRANCH=testing/" "$BRANCH_PATH"
+      sed -i "s/^BRANCH=.*/BRANCH=beta/" "$BRANCH_PATH"
       exit 0
       ;;
     "rc")
-      sed -i "s/^BRANCH=.*/BRANCH=unstable/" "$BRANCH_PATH"
+      sed -i "s/^BRANCH=.*/BRANCH=rc/" "$BRANCH_PATH"
       exit 0
       ;;
   esac
